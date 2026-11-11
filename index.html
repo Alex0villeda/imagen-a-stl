@@ -122,6 +122,9 @@ footer{color:var(--muted);font-size:13px;max-width:75ch}
             <select id="fq"><option value="30">Estándar</option><option value="10">Rápida</option><option value="50">Alta (gasta más cuota)</option></select></div>
           <div class="row"><label for="fd">Detalle de la malla</label><span></span>
             <select id="fd"><option value="256">Estándar</option><option value="384">Alto</option><option value="196">Bajo</option></select></div>
+          <div class="row"><label for="ft">Triángulos del archivo</label><span></span>
+            <select id="ft"><option value="300000">Hasta 300 mil (recomendado)</option><option value="120000">Hasta 120 mil (archivo ligero)</option><option value="700000">Hasta 700 mil</option><option value="0">Sin reducir</option></select></div>
+          <div class="row"><label for="fsm">Suavizar superficie</label><output id="o-fsm"></output><input type="range" id="fsm" min="0" max="12" step="1" value="0"></div>
           <label class="check"><input type="checkbox" id="frembg" checked> <span>Quitar el fondo de la foto</span></label>
           <button id="gen" type="button">Generar modelo 3D</button>
           <p class="hint" id="fullmsg">Sube una foto de un solo objeto y pulsa Generar. Cada visitante tiene unas pocas generaciones gratis por día.</p>
@@ -352,6 +355,52 @@ function orientForPrint(m, size) {
   return m;
 }
 
+/* Agrupa vértices en una rejilla de N celdas por lado: suelda duplicados (N grande) o reduce la malla (N pequeño).
+   Elimina triángulos degenerados y repetidos, que hacen que algunos laminadores rechacen el archivo. */
+function clusterMesh(m, N) {
+  const b = meshBounds(m), ext = Math.max(b.hi[0] - b.lo[0], b.hi[1] - b.lo[1], b.hi[2] - b.lo[2], 1e-9), k = (N - 1) / ext;
+  const V = m.pos.length / 3, id = new Uint32Array(V), map = new Map(), sum = [], cnt = [];
+  for (let i = 0; i < V; i++) {
+    const x = m.pos[i * 3], y = m.pos[i * 3 + 1], z = m.pos[i * 3 + 2];
+    const key = (Math.round((x - b.lo[0]) * k) * N + Math.round((y - b.lo[1]) * k)) * N + Math.round((z - b.lo[2]) * k);
+    let v = map.get(key); if (v === undefined) { v = cnt.length; map.set(key, v); sum.push(0, 0, 0); cnt.push(0); }
+    sum[v * 3] += x; sum[v * 3 + 1] += y; sum[v * 3 + 2] += z; cnt[v]++; id[i] = v;
+  }
+  const nv = cnt.length, idx = [], seen = nv < 200000 ? new Set() : null;
+  for (let t = 0; t < m.idx.length; t += 3) {
+    const a = id[m.idx[t]], c = id[m.idx[t + 1]], d = id[m.idx[t + 2]];
+    if (a === c || c === d || a === d) continue;
+    if (seen) { const lo = Math.min(a, c, d), hi = Math.max(a, c, d), mid = a + c + d - lo - hi, key = (lo * nv + mid) * nv + hi; if (seen.has(key)) continue; seen.add(key); }
+    idx.push(a, c, d);
+  }
+  const used = new Int32Array(nv).fill(-1), pos = []; 
+  for (let i = 0; i < idx.length; i++) { const v = idx[i]; if (used[v] < 0) { used[v] = pos.length / 3; pos.push(sum[v * 3] / cnt[v], sum[v * 3 + 1] / cnt[v], sum[v * 3 + 2] / cnt[v]); } idx[i] = used[v]; }
+  return { pos: new Float32Array(pos), idx: new Uint32Array(idx) };
+}
+
+/* Limpia la malla y, si pasa de "target" triángulos (0 = sin límite), la reduce hasta quedar por debajo. */
+function simplifyMesh(m, target) {
+  const clean = clusterMesh(m, 200000);
+  if (!target || clean.idx.length / 3 <= target) return clean;
+  let lo = 8, hi = 2048, best = null;
+  for (let it = 0; it < 9 && lo <= hi; it++) { const mid = (lo + hi) >> 1, c = clusterMesh(clean, mid);
+    if (c.idx.length / 3 <= target) { best = c; lo = mid + 1; } else hi = mid - 1; }
+  return best || clusterMesh(clean, 8);
+}
+
+/* Suavizado laplaciano: cada vértice se acerca al promedio de sus vecinos. */
+function smoothMesh(m, passes) {
+  const p = m.pos, V = p.length / 3, acc = new Float32Array(V * 3), n = new Uint32Array(V);
+  for (let it = 0; it < passes; it++) {
+    acc.fill(0); n.fill(0);
+    for (let t = 0; t < m.idx.length; t += 3) for (let j = 0; j < 3; j++) { const a = m.idx[t + j], b = m.idx[t + (j + 1) % 3];
+      acc[a * 3] += p[b * 3]; acc[a * 3 + 1] += p[b * 3 + 1]; acc[a * 3 + 2] += p[b * 3 + 2]; n[a]++;
+      acc[b * 3] += p[a * 3]; acc[b * 3 + 1] += p[a * 3 + 1]; acc[b * 3 + 2] += p[a * 3 + 2]; n[b]++; }
+    for (let i = 0; i < V; i++) if (n[i]) for (let j = 0; j < 3; j++) p[i * 3 + j] += 0.5 * (acc[i * 3 + j] / n[i] - p[i * 3 + j]);
+  }
+  return m;
+}
+
 function meshVolume(m) {
   const p = m.pos; let vol = 0;
   for (let i = 0; i < m.idx.length; i += 3) { const a = m.idx[i] * 3, b = m.idx[i + 1] * 3, c = m.idx[i + 2] * 3;
@@ -458,7 +507,7 @@ async function to3MF(m) {
   const AI_HELP = "La IA calcula qué partes de la foto están más cerca. Da mejor resultado con fotos de objetos, caras y paisajes.";
   const SPACE_HOST = "https://tencent-hunyuan3d-2.hf.space";
   const FULL_HELP = "Sube una foto de un solo objeto y pulsa Generar. Cada visitante tiene unas pocas generaciones gratis por día.";
-  let aiRaw = null, genFn = null, genBusy = false;
+  let aiRaw = null, aiParsed = null, aiKey = "", genFn = null, genBusy = false;
   const HINTS = {
     full: "Reconstruye el objeto entero, con su parte de atrás, a partir de una sola foto. Funciona mejor con un objeto centrado y fondo liso.",
     relief: "Lo claro sube y lo oscuro queda bajo. Sirve para placas, mapas de altura y logos con volumen.",
@@ -503,7 +552,8 @@ async function to3MF(m) {
     if (!img) return;
     const mode = document.querySelector("input[name=mode]:checked").value, useAI = $("src").value === "ai";
     if (mode === "full") {
-      mesh = aiRaw ? orientForPrint({ pos: aiRaw.pos.slice(), idx: aiRaw.idx }, +$("width").value) : null;
+      if (aiParsed && aiKey !== $("ft").value) { aiKey = $("ft").value; aiRaw = simplifyMesh(aiParsed, +aiKey); }
+      mesh = aiRaw ? orientForPrint(smoothMesh({ pos: aiRaw.pos.slice(), idx: aiRaw.idx }, +$("fsm").value), +$("width").value) : null;
       flat = false; say(""); show(); return;
     }
     if (useAI && !depthCanvas) { runAI(); return; }
@@ -602,7 +652,8 @@ async function to3MF(m) {
       const url = f && (f.url || (f.path ? SPACE_HOST + "/file=" + f.path : null));
       if (!url) throw new Error("El servidor no devolvió el modelo.");
       const r = await fetch(url); if (!r.ok) throw new Error("No se pudo descargar el modelo generado (" + r.status + ").");
-      aiRaw = parseGLB(await r.arrayBuffer()); framed = "";
+      const glb = await r.arrayBuffer(); fullSay("Limpiando y preparando la malla…"); await new Promise(x => setTimeout(x, 30));
+      aiParsed = parseGLB(glb); aiRaw = null; aiKey = ""; framed = "";
       fullSay("Modelo listo. Ajusta el tamaño y descárgalo. Revísalo en el laminador antes de imprimir.");
     } catch (e) {
       const t = String((e && (e.message || e.title)) || e || "");
@@ -677,7 +728,7 @@ async function to3MF(m) {
   const mm = v => (+v).toFixed(1) + " mm";
   const FMT = { width: v => v + " mm", relief: mm, base: mm, res: v => v + " puntos", thr: v => v + " %", tol: v => v + " %",
     smooth: v => v == 0 ? "sin suavizar" : v + (v == 1 ? " pasada" : " pasadas"), bright: v => (v > 0 ? "+" : "") + v, contrast: v => v + " %",
-    gamma: v => (+v).toFixed(2), frame: v => v == 0 ? "sin marco" : mm(v), levels: v => v == 1 ? "continuo" : v + " niveles", bend: v => v == 0 ? "plana" : v + "°" };
+    gamma: v => (+v).toFixed(2), fsm: v => v == 0 ? "sin suavizar" : v + (v == 1 ? " pasada" : " pasadas"), frame: v => v == 0 ? "sin marco" : mm(v), levels: v => v == 1 ? "continuo" : v + " niveles", bend: v => v == 0 ? "plana" : v + "°" };
   function labels() { for (const id in FMT) $("o-" + id).textContent = FMT[id]($(id).value); }
   function applyMode(preset) {
     const mode = document.querySelector("input[name=mode]:checked").value, shape = mode === "shape", full = mode === "full", sh = $("shape").value;
@@ -709,7 +760,7 @@ async function to3MF(m) {
   }
   function load(file) {
     if (!file || !file.type.startsWith("image/")) { say("Ese archivo no es una imagen. Usa PNG, JPG, WebP o SVG.", true); return; }
-    const done = im => { img = im; depthCanvas = null; aiRaw = null; fullSay(FULL_HELP);
+    const done = im => { img = im; depthCanvas = null; aiRaw = aiParsed = null; aiKey = ""; fullSay(FULL_HELP);
       imgName = file.name.replace(/\.[^.]+$/, "").replace(/[^\w\-]+/g, "_") || "modelo";
       $("fname").textContent = file.name; $("extag").hidden = true; aiSay(AI_HELP); thumb(); framed = ""; rebuild(); };
     const fail = () => say("No se pudo leer la imagen. Prueba con otro archivo.", true);
